@@ -52,7 +52,7 @@ GCC and Clang both work. The build writes `build/nocturne` and the texture baker
 ## Build on Windows
 
 1. Install [MSYS2](https://www.msys2.org).
-2. Open the **MSYS2 UCRT64** shell and install the tools and libraries:
+2. Open the **MSYS2 UCRT64** shell from the Start menu. MSYS2 installs software with `pacman`, the package manager it takes from Arch Linux. Install the tools and libraries:
 
    ```
    pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-zydis mingw-w64-ucrt-x86_64-python

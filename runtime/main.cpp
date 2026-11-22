@@ -1,3 +1,4 @@
+#include "firstrun.h"
 #include "options.h"
 #include "pe.h"
 #include "win32.h"
@@ -9,13 +10,32 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+
+fs::path defaultGameDir() {
+    const char* base = SDL_GetBasePath();
+    return (base ? fs::path(reinterpret_cast<const char8_t*>(base)) : fs::current_path()) / "game";
+}
+
+}
+
 int main(int argc, char** argv) {
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: %s <game directory>\n", argv[0]);
+    if (argc > 2) {
+        std::fprintf(stderr, "usage: %s [game folder]\n", argv[0]);
         return 2;
     }
-    fs::path gameDir = fs::absolute(argv[1]);
+    fs::path gameDir = argc == 2 ? fs::absolute(argv[1]) : defaultGameDir();
+#ifdef _WIN32
+    std::error_code ec;
+    fs::create_directories(gameDir, ec);
+    if (_wfreopen((gameDir / "nocturne.log").c_str(), L"w", stderr)) {
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+    }
+#endif
+    if (!firstrun_setup(gameDir)) {
+        return 1;
+    }
     PeImage pe;
     std::string err;
     if (!pe.load((gameDir / "nocturne.exe").string(), err)) {

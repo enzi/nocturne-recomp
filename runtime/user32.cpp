@@ -450,6 +450,9 @@ HLE("user32", MessageBoxA, 4) {
     std::string text = gstring(a[1]);
     std::string caption = gstring(a[2]);
     std::fprintf(stderr, "[user32] MessageBox \"%s\": %s\n", caption.c_str(), text.c_str());
+    if (text == "Unable to open .AVI!") {
+        return 1;
+    }
     const char* driver = SDL_GetCurrentVideoDriver();
     if (!driver || std::strcmp(driver, "offscreen") != 0) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, caption.c_str(), text.c_str(), g_window);

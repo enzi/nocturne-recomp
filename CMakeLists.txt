@@ -24,6 +24,16 @@ set(RECOMP_CHUNKS 16)
 add_library(pe STATIC common/pe.cpp)
 target_include_directories(pe PUBLIC common)
 
+add_library(stb STATIC runtime/stb.cpp)
+target_include_directories(stb PUBLIC third_party)
+
+add_library(gamesetup STATIC runtime/gamesetup.cpp)
+target_include_directories(gamesetup PUBLIC runtime)
+target_link_libraries(gamesetup PRIVATE stb)
+
+add_executable(nocsetup tools/nocsetup.cpp)
+target_link_libraries(nocsetup PRIVATE gamesetup)
+
 if(NOCTURNE_RECOMPILER)
     set(RECOMPILER "${NOCTURNE_RECOMPILER}")
 else()
@@ -57,7 +67,7 @@ add_library(scenebake STATIC
     runtime/scene.cpp
     third_party/xatlas/xatlas.cpp)
 target_include_directories(scenebake PUBLIC runtime third_party)
-target_link_libraries(scenebake PUBLIC Threads::Threads SDL3::SDL3 ${OPENGL_TARGET})
+target_link_libraries(scenebake PUBLIC stb Threads::Threads SDL3::SDL3 ${OPENGL_TARGET})
 
 add_executable(nocbake tools/nocbake.cpp)
 target_link_libraries(nocbake PRIVATE scenebake)
@@ -67,6 +77,7 @@ add_executable(nocturne
     runtime/ddraw.cpp
     runtime/display.cpp
     runtime/dsound.cpp
+    runtime/firstrun.cpp
     runtime/gdi32.cpp
     runtime/guest.cpp
     runtime/hle.cpp
@@ -83,11 +94,13 @@ add_executable(nocturne
     runtime/wsock32.cpp
     ${GEN_SOURCES})
 target_include_directories(nocturne PRIVATE runtime third_party "${GEN_DIR}")
-target_link_libraries(nocturne PRIVATE pe scenebake)
+target_link_libraries(nocturne PRIVATE pe gamesetup scenebake)
 
 if(MINGW)
+    set_target_properties(nocturne PROPERTIES WIN32_EXECUTABLE ON)
     target_link_options(nocturne PRIVATE -static -Wl,--stack,8388608)
     target_link_options(nocbake PRIVATE -static)
+    target_link_options(nocsetup PRIVATE -static)
     add_custom_command(TARGET nocturne POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:nocturne> $<TARGET_FILE_DIR:nocturne>
         COMMAND_EXPAND_LISTS)
