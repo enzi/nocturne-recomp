@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nocturne Level Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #backdrop { position: absolute; pointer-events: none; opacity: 0; image-rendering: auto; }
+  #panel { position: absolute; top: 12px; left: 12px; width: 260px; padding: 12px; background: rgba(12, 12, 16, 0.82); border: 1px solid #333; border-radius: 6px; }
+  #panel label { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 0; }
+  #panel select, #panel input[type=range] { width: 150px; }
+  #panel select { background: #1c1c22; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; }
+  #panel .check { justify-content: flex-start; }
+  #cycle { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
+  #cycle button { background: #1c1c22; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 2px 10px; cursor: pointer; }
+  #cycle button:hover { background: #2a2a33; }
+  #cycleLabel { flex: 1; text-align: center; color: #aab; font-variant-numeric: tabular-nums; }
+  #status { margin-top: 10px; white-space: pre-line; color: #aab; font-variant-numeric: tabular-nums; }
+  #help { margin-top: 8px; color: #889; font-size: 12px; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<img id="backdrop" alt="">
+<div id="panel">
+  <label>Level <select id="level"></select></label>
+  <label>Camera <select id="camera"></select></label>
+  <div id="cycle"><button id="prevCamera" title="Previous camera ([)">&#9664;</button><span id="cycleLabel"></span><button id="nextCamera" title="Next camera (])">&#9654;</button></div>
+  <label>Textures <select id="texsize"><option value="4096">4096</option><option value="2048">2048</option><option value="1024">1024</option></select></label>
+  <label>Backdrop <input type="range" id="overlay" min="0" max="1" step="0.05" value="0"></label>
+  <label class="check"><input type="checkbox" id="cull" checked> Hide back faces</label>
+  <label class="check"><input type="checkbox" id="filled"> Mark filled texels</label>
+  <div id="status"></div>
+  <div id="help">Click the view to look around, Esc to release. WASD moves, Space and C go up and down, Shift is faster, the mouse wheel changes speed, B toggles the backdrop at a game camera, [ and ] step through the game cameras.</div>
+</div>
+<script>
+const root = '../../data/';
+const canvas = document.getElementById('view');
+const backdrop = document.getElementById('backdrop');
+const cycleLabel = document.getElementById('cycleLabel');
+const ui = {
+  level: document.getElementById('level'),
+  camera: document.getElementById('camera'),
+  texsize: document.getElementById('texsize'),
+  overlay: document.getElementById('overlay'),
+  cull: document.getElementById('cull'),
+  filled: document.getElementById('filled'),
+  status: document.getElementById('status'),
+};
+const gl = canvas.getContext('webgl2', { antialias: true });
+const aniso = gl && gl.getExtension('EXT_texture_filter_anisotropic');
+
+const vertexSource = `#version 300 es
+layout(location = 0) in vec3 pos;
+layout(location = 1) in vec3 normal;
+layout(location = 2) in vec3 uvPage;
+uniform vec3 eye;
+uniform vec3 right;
+uniform vec3 up;
+uniform vec3 fwd;
+uniform vec2 scale;
+out vec3 vPos;
+out vec3 vNormal;
+out vec2 vUv;
+flat out int vPage;
+void main() {
+  vec3 d = pos - eye;
+  vec3 c = vec3(dot(right, d), dot(up, d), dot(fwd, d));
+  const float near = 0.5;
+  const float far = 6000.0;
+  gl_Position = vec4(c.x * scale.x, c.y * scale.y, c.z * (far + near) / (far - near) - 2.0 * far * near / (far - near), c.z);
+  vPos = pos;
+  vNormal = normal;
+  vUv = uvPage.xy;
+  vPage = int(floor(uvPage.z + 0.5));
+}`;
+
+const fragmentSource = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+in vec3 vPos;
+in vec3 vNormal;
+in vec2 vUv;
+flat in int vPage;
+uniform sampler2DArray atlas;
+uniform float pageSize;
+uniform vec3 eye;
+uniform bool cull;
+uniform bool markFilled;
+uniform uint loadedPages;
+out vec4 color;
+void main() {
+  vec3 n = normalize(vNormal);
+  if (dot(n, eye - vPos) < 0.0) {
+    if (cull) {
+      discard;
+    }
+    color = vec4(0.08, 0.0, 0.0, 1.0);
+    return;
+  }
+  if (vPage < 0 || vPage > 31 || (loadedPages & (1u << uint(vPage))) == 0u) {
+    color = vec4(vec3(0.15 + 0.1 * abs(n.y)), 1.0);
+    return;
+  }
+  vec4 t = texture(atlas, vec3(vUv / pageSize, float(vPage)));
+  color = vec4(markFilled && t.a < 0.75 ? mix(t.rgb, vec3(1.0, 0.9, 0.0), 0.5) : t.rgb, 1.0);
+}`;
+
+function compile(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(shader));
+  }
+  return shader;
+}
+
+function createProgram() {
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexSource));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragmentSource));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program));
+  }
+  const uniforms = {};
+  for (const name of ['eye', 'right', 'up', 'fwd', 'scale', 'atlas', 'pageSize', 'cull', 'markFilled', 'loadedPages']) {
+    uniforms[name] = gl.getUniformLocation(program, name);
+  }
+  return { program, uniforms };
+}
+
+const view = { pos: [0, 0, 0], yaw: 0, pitch: 0, snapped: -1, lastCamera: -1 };
+const keys = new Set();
+let speed = 12;
+let level = null;
+let loadToken = 0;
+let overlayMemory = 0.5;
+let status = '';
+let program = null;
+
+function setStatus(text) {
+  status = text;
+}
+
+function cross(a, b) {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+
+function basis() {
+  if (view.snapped >= 0) {
+    const m = level.scene.cameras[view.snapped].m;
+    return { right: [m[0], m[3], m[6]], up: [m[1], m[4], m[7]], fwd: [m[2], m[5], m[8]] };
+  }
+  const cp = Math.cos(view.pitch);
+  const fwd = [cp * Math.sin(view.yaw), Math.sin(view.pitch), cp * Math.cos(view.yaw)];
+  const length = Math.hypot(fwd[2], fwd[0]);
+  const right = [fwd[2] / length, 0, -fwd[0] / length];
+  return { right, up: cross(fwd, right), fwd };
+}
+
+function unsnap() {
+  if (view.snapped < 0) {
+    return;
+  }
+  const b = basis();
+  view.yaw = Math.atan2(b.fwd[0], b.fwd[2]);
+  view.pitch = Math.asin(Math.max(-1, Math.min(1, b.fwd[1])));
+  view.snapped = -1;
+  ui.camera.value = '';
+}
+
+function snapTo(index) {
+  const cam = level.scene.cameras[index];
+  view.pos = cam.pos.slice();
+  view.snapped = index;
+  view.lastCamera = index;
+  ui.camera.value = String(index);
+  backdrop.src = `${root}export/${level.name}/backdrops/${cam.name}.png`;
+}
+
+function freeLevel() {
+  if (!level) {
+    return;
+  }
+  gl.deleteVertexArray(level.vao);
+  for (const buffer of level.buffers) {
+    gl.deleteBuffer(buffer);
+  }
+  if (level.atlas) {
+    gl.deleteTexture(level.atlas);
+  }
+  level = null;
+}
+
+async function fetchOk(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`${url}: ${response.status} ${response.statusText}`);
+  }
+  return response;
+}
+
+async function loadPages(token) {
+  const scene = level.scene;
+  const pages = scene.pages.length;
+  if (!pages) {
+    return;
+  }
+  const size = Math.min(Number(ui.texsize.value), scene.pageSize);
+  if (level.atlas) {
+    gl.deleteTexture(level.atlas);
+  }
+  level.loadedPages = 0;
+  const atlas = gl.createTexture();
+  level.atlas = atlas;
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlas);
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, Math.log2(size) + 1, gl.RGBA8, size, size, pages);
+  if (gl.getError() === gl.OUT_OF_MEMORY) {
+    setStatus(`Not enough GPU memory for ${pages} pages at ${size}. Pick a smaller texture size.`);
+    return;
+  }
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const options = { premultiplyAlpha: 'none', colorSpaceConversion: 'none' };
+  if (size < scene.pageSize) {
+    Object.assign(options, { resizeWidth: size, resizeHeight: size, resizeQuality: 'high' });
+  }
+  let done = 0;
+  const load = async (page) => {
+    const blob = await (await fetchOk(`${root}game/baked/${level.name}/page${page}.png`)).blob();
+    const bitmap = await createImageBitmap(blob, options);
+    if (token !== loadToken) {
+      bitmap.close();
+      return;
+    }
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlas);
+    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, page, size, size, 1, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+    bitmap.close();
+    level.loadedPages |= 1 << page;
+    done++;
+    setStatus(`Loading textures ${done} of ${pages}`);
+  };
+  const queue = [...Array(pages).keys()];
+  await Promise.all([0, 1, 2, 3].map(async () => {
+    while (queue.length && token === loadToken) {
+      await load(queue.shift());
+    }
+  }));
+  if (token !== loadToken) {
+    return;
+  }
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlas);
+  gl.generateMipmap(gl.TEXTURE_2D_ARRAY);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  if (aniso) {
+    gl.texParameterf(gl.TEXTURE_2D_ARRAY, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+  }
+  setStatus('');
+}
+
+async function loadLevel(name) {
+  const token = ++loadToken;
+  setStatus(`Loading ${name}`);
+  const scene = await (await fetchOk(`${root}export/${name}/scene.json`)).json();
+  const buffer = await (await fetchOk(`${root}export/${name}/mesh.bin`)).arrayBuffer();
+  if (token !== loadToken) {
+    return;
+  }
+  freeLevel();
+  const [count, hasUv] = new Uint32Array(buffer, 0, 2);
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const verts = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, verts);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(buffer, 8, count * 7), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 28, 12);
+  const buffers = [verts];
+  if (hasUv) {
+    const uv = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, uv);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(buffer, 8 + count * 28, count * 3), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 12, 0);
+    buffers.push(uv);
+  } else {
+    gl.vertexAttrib3f(2, 0, 0, -1);
+  }
+  gl.bindVertexArray(null);
+  level = { name, scene, vao, buffers, count, atlas: null, loadedPages: 0 };
+  ui.camera.innerHTML = '<option value="">Free flight</option>' + scene.cameras.map((c, i) => `<option value="${i}">${c.name}</option>`).join('');
+  snapTo(0);
+  location.hash = name;
+  await loadPages(token);
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(canvas.clientWidth * dpr);
+  const h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  return dpr;
+}
+
+function nearestCamera() {
+  let best = null;
+  let bestDistance = Infinity;
+  for (const cam of level.scene.cameras) {
+    const d = Math.hypot(cam.pos[0] - view.pos[0], cam.pos[1] - view.pos[1], cam.pos[2] - view.pos[2]);
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = cam;
+    }
+  }
+  return best ? `${best.name}, ${bestDistance.toFixed(0)} units away` : '';
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  const dpr = resize();
+  if (level) {
+    const move = [0, 0, 0];
+    const b0 = basis();
+    const add = (v, s) => { for (let k = 0; k < 3; k++) move[k] += v[k] * s; };
+    if (keys.has('KeyW')) add(b0.fwd, 1);
+    if (keys.has('KeyS')) add(b0.fwd, -1);
+    if (keys.has('KeyD')) add(b0.right, 1);
+    if (keys.has('KeyA')) add(b0.right, -1);
+    if (keys.has('Space')) move[1] += 1;
+    if (keys.has('KeyC')) move[1] -= 1;
+    if (move.some((v) => v !== 0)) {
+      unsnap();
+      const s = speed * dt * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 4 : 1);
+      for (let k = 0; k < 3; k++) view.pos[k] += move[k] * s;
+    }
+    let x = 0, y = 0, w = canvas.width, h = canvas.height;
+    if (view.snapped >= 0) {
+      if (w / h > 4 / 3) {
+        w = Math.round(h * 4 / 3);
+        x = Math.round((canvas.width - w) / 2);
+      } else {
+        h = Math.round(w * 3 / 4);
+        y = Math.round((canvas.height - h) / 2);
+      }
+      Object.assign(backdrop.style, { left: `${x / dpr}px`, top: `${(canvas.height - y - h) / dpr}px`, width: `${w / dpr}px`, height: `${h / dpr}px`, opacity: ui.overlay.value });
+    } else {
+      backdrop.style.opacity = 0;
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.viewport(x, y, w, h);
+    gl.enable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    const b = basis();
+    const scale = view.snapped >= 0 ? [level.scene.cameras[view.snapped].f / 320, level.scene.cameras[view.snapped].f / 240] : (() => {
+      const f = (w / 2) / Math.tan(40 * Math.PI / 180);
+      return [f / (w / 2), f / (h / 2)];
+    })();
+    const u = program.uniforms;
+    gl.useProgram(program.program);
+    gl.uniform3fv(u.eye, view.pos);
+    gl.uniform3fv(u.right, b.right);
+    gl.uniform3fv(u.up, b.up);
+    gl.uniform3fv(u.fwd, b.fwd);
+    gl.uniform2fv(u.scale, scale);
+    gl.uniform1f(u.pageSize, level.scene.pageSize || 4096);
+    gl.uniform1i(u.cull, ui.cull.checked);
+    gl.uniform1i(u.markFilled, ui.filled.checked);
+    gl.uniform1ui(u.loadedPages, level.loadedPages >>> 0);
+    gl.uniform1i(u.atlas, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, level.atlas);
+    gl.bindVertexArray(level.vao);
+    gl.drawArrays(gl.TRIANGLES, 0, level.count);
+    gl.bindVertexArray(null);
+    const p = view.pos.map((v) => v.toFixed(1)).join(', ');
+    const cameras = level.scene.cameras;
+    cycleLabel.textContent = view.snapped >= 0 ? `${cameras[view.snapped].name}, ${view.snapped + 1} of ${cameras.length}` : `Free flight, ${cameras.length} cameras`;
+    ui.status.textContent = `${status ? status + '\n' : ''}${level.name}, ${(level.count / 3).toLocaleString()} triangles\nPosition ${p}\nNearest camera ${nearestCamera()}\nSpeed ${speed.toFixed(1)} units/s`;
+  }
+  requestAnimationFrame(frame);
+}
+
+canvas.addEventListener('webglcontextlost', (e) => {
+  e.preventDefault();
+  loadToken++;
+  ui.status.textContent = 'The GPU dropped the WebGL context, usually because it ran out of memory. Pick a smaller texture size and reload the page.';
+  level = null;
+});
+canvas.addEventListener('click', () => canvas.requestPointerLock());
+document.addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement !== canvas || !level) {
+    return;
+  }
+  unsnap();
+  view.yaw += e.movementX * 0.0025;
+  view.pitch = Math.max(-1.55, Math.min(1.55, view.pitch - e.movementY * 0.0025));
+});
+document.addEventListener('keydown', (e) => {
+  if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLInputElement) {
+    return;
+  }
+  if (level && (e.code === 'BracketLeft' || e.code === 'BracketRight')) {
+    cycleCamera(e.code === 'BracketRight' ? 1 : -1);
+  }
+  if (e.code === 'KeyB') {
+    if (Number(ui.overlay.value) > 0) {
+      overlayMemory = Number(ui.overlay.value);
+      ui.overlay.value = 0;
+    } else {
+      ui.overlay.value = overlayMemory;
+    }
+  }
+  if (e.code === 'Space') {
+    e.preventDefault();
+  }
+  keys.add(e.code);
+});
+document.addEventListener('keyup', (e) => keys.delete(e.code));
+window.addEventListener('blur', () => keys.clear());
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  speed = Math.max(0.5, Math.min(500, speed * Math.exp(-e.deltaY * 0.001)));
+}, { passive: false });
+ui.level.addEventListener('change', () => {
+  ui.level.blur();
+  loadLevel(ui.level.value).catch((err) => setStatus(err.message));
+});
+function cycleCamera(step) {
+  const count = level.scene.cameras.length;
+  const from = view.snapped >= 0 ? view.snapped : view.lastCamera;
+  snapTo(from < 0 ? (step > 0 ? 0 : count - 1) : (from + step + count) % count);
+}
+document.getElementById('prevCamera').addEventListener('click', (e) => {
+  e.currentTarget.blur();
+  if (level) {
+    cycleCamera(-1);
+  }
+});
+document.getElementById('nextCamera').addEventListener('click', (e) => {
+  e.currentTarget.blur();
+  if (level) {
+    cycleCamera(1);
+  }
+});
+ui.camera.addEventListener('change', () => {
+  ui.camera.blur();
+  if (ui.camera.value !== '') {
+    snapTo(Number(ui.camera.value));
+    if (Number(ui.overlay.value) === 0) {
+      ui.overlay.value = overlayMemory;
+    }
+  }
+});
+ui.texsize.addEventListener('change', () => {
+  ui.texsize.blur();
+  if (level) {
+    loadPages(++loadToken).catch((err) => setStatus(err.message));
+  }
+});
+
+async function start() {
+  if (!gl) {
+    ui.status.textContent = 'This browser has no WebGL2.';
+    return;
+  }
+  program = createProgram();
+  requestAnimationFrame(frame);
+  try {
+    const levels = await (await fetchOk(`${root}export/levels.json`)).json();
+    ui.level.innerHTML = levels.map((name) => `<option>${name}</option>`).join('');
+    const wanted = location.hash.slice(1).toUpperCase();
+    ui.level.value = levels.includes(wanted) ? wanted : levels[0];
+    await loadLevel(ui.level.value);
+  } catch (err) {
+    ui.status.textContent = `${err.message}\nServe the repository root, for example with python3 -m http.server, and run nocbake with --export first.`;
+  }
+}
+
+start();
+</script>
+</body>
+</html>

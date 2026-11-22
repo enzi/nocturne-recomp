@@ -1,0 +1,5 @@
+00557660 timer_init_and_cpu_benchmark
+004c1100 battery_update
+00451ef0 goggle_composite
+005093b0 ir_frame
+0050d5e0 object_face_visible
